@@ -1,3 +1,4 @@
+import ctypes
 import os
 import stat
 import subprocess
@@ -110,3 +111,76 @@ def test_remove_symbol_newline_names(tmp_path: Path, force_relocate: bool):
     assert sorted(s.name for s in new.symtab_symbols) == expected
 
     check_layout(new)
+
+
+def test_remove_dynamic_symbol_shrink_tables(tmp_path: Path):
+    """Removing dynamic symbols must shrink .dynsym / .gnu.version /
+    .gnu.version_d in place (default config): the sections keep their
+    original offsets and virtual addresses, the re-parsed symbols match
+    the in-memory model, and version definitions that are no longer
+    referenced are dropped along with DT_VERDEFNUM.
+    """
+    target = parse_elf("ELF/lib_symbol_versions.so")
+
+    orig_layout = {
+        sec.name: (sec.virtual_address, sec.offset, sec.size)
+        for sec in target.sections
+    }
+    nb_verdef = len(target.symbols_version_definition)
+    assert nb_verdef == 3
+
+    # 'LIBFOO_1.0' is the only symbol bound to the LIBFOO_1.0 version
+    # definition: removing it must drop the definition as well.
+    target.remove_dynamic_symbol("LIBFOO_1.0")
+
+    expected_names = [s.name for s in target.dynamic_symbols]
+    assert len(target.symbols_version_definition) == nb_verdef - 1
+    assert target[lief.ELF.DynamicEntry.TAG.VERDEFNUM].value == nb_verdef - 1
+
+    output = tmp_path / "lib_symbol_versions.stripped.so"
+    target.write(output)
+
+    new = lief.ELF.parse(output)
+    assert new is not None
+
+    # The re-parsed symbols must exactly match the in-memory model
+    # (i.e. no ghost symbols from the previous table)
+    assert [s.name for s in new.dynamic_symbols] == expected_names
+
+    # The emptied version definition must be gone from .gnu.version_d
+    # and DT_VERDEFNUM
+    assert {d.ndx for d in new.symbols_version_definition} == {1, 3}
+    assert new[lief.ELF.DynamicEntry.TAG.VERDEFNUM].value == nb_verdef - 1
+
+    for sec in new.sections:
+        va, offset, _ = orig_layout[sec.name]
+        # All the sections must keep their original location
+        assert (sec.virtual_address, sec.offset) == (va, offset)
+
+    # ... while the tables themselves are shrunk in place
+    dynsym = new.get_section(".dynsym")
+    assert dynsym.size == len(expected_names) * dynsym.entry_size
+    assert dynsym.size < orig_layout[".dynsym"][2]
+
+    versym = new.get_section(".gnu.version")
+    assert versym.size == len(expected_names) * 2
+    assert versym.size < orig_layout[".gnu.version"][2]
+
+    verdef = new.get_section(".gnu.version_d")
+    assert verdef.size < orig_layout[".gnu.version_d"][2]
+
+    check_layout(new)
+
+    if is_linux() and is_x86_64():
+        st = os.stat(output)
+        os.chmod(output, st.st_mode | stat.S_IEXEC)
+
+        lib = ctypes.cdll.LoadLibrary(output.as_posix())
+
+        # The remaining export must still be resolvable. foo is bound to
+        # a non-default version (foo@LIBFOO_2.0) so it needs dlvsym.
+        libc = ctypes.CDLL("libc.so.6")
+        dlvsym = libc.dlvsym
+        dlvsym.restype = ctypes.c_void_p
+        addr = dlvsym(ctypes.c_void_p(lib._handle), b"foo", b"LIBFOO_2.0")
+        assert addr

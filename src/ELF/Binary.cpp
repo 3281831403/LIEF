@@ -42,6 +42,7 @@
 #include "LIEF/ELF/Segment.hpp"
 #include "LIEF/ELF/Symbol.hpp"
 #include "LIEF/ELF/SymbolVersion.hpp"
+#include "LIEF/ELF/SymbolVersionAux.hpp"
 #include "LIEF/ELF/SymbolVersionAuxRequirement.hpp"
 #include "LIEF/ELF/SymbolVersionDefinition.hpp"
 #include "LIEF/ELF/SymbolVersionRequirement.hpp"
@@ -641,7 +642,11 @@ void Binary::remove_dynamic_symbol(Symbol* symbol) {
   }
 
   // Update symbol versions
+  const SymbolVersionAux* sym_ver_aux = nullptr;
   if (symbol->has_version()) {
+    if (const SymbolVersion* sv = symbol->symbol_version_) {
+      sym_ver_aux = sv->symbol_version_auxiliary();
+    }
     const auto it =
         std::find_if(symbol_version_table_.begin(), symbol_version_table_.end(),
                      [symbol](const std::unique_ptr<SymbolVersion>& sv) {
@@ -653,6 +658,52 @@ void Binary::remove_dynamic_symbol(Symbol* symbol) {
   }
 
   dynamic_symbols_.erase(it_symbol);
+
+  // If the removed symbol was the last one referencing its version
+  // definition, drop the definition as well so that .gnu.version_d and
+  // DT_VERDEFNUM stay consistent with the remaining dynamic symbols.
+  if (sym_ver_aux != nullptr) {
+    const auto belongs_to = [](const SymbolVersionDefinition& def,
+                               const SymbolVersionAux* aux) {
+      for (const SymbolVersionAux& sva : def.symbols_aux()) {
+        if (&sva == aux) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const auto it_def =
+        std::find_if(symbol_version_definition_.begin(),
+                     symbol_version_definition_.end(),
+                     [&belongs_to, sym_ver_aux](
+                         const std::unique_ptr<SymbolVersionDefinition>& def) {
+                       return belongs_to(*def, sym_ver_aux);
+                     });
+
+    if (it_def != symbol_version_definition_.end()) {
+      const SymbolVersionDefinition& def = **it_def;
+      const bool still_used =
+          std::any_of(symbol_version_table_.begin(), symbol_version_table_.end(),
+                      [&def, &belongs_to](const std::unique_ptr<SymbolVersion>& sv) {
+                        const SymbolVersionAux* aux =
+                            sv->symbol_version_auxiliary();
+                        return aux != nullptr && belongs_to(def, aux);
+                      });
+      if (!still_used) {
+        LIEF_DEBUG("Remove version definition (ndx: {}) since it is no longer "
+                   "referenced by any dynamic symbol",
+                   def.ndx());
+        symbol_version_definition_.erase(it_def);
+        if (DynamicEntry* dt_verdefnum = get(DynamicEntry::TAG::VERDEFNUM)) {
+          const uint64_t nb_def = dt_verdefnum->value();
+          if (nb_def > 0) {
+            dt_verdefnum->value(nb_def - 1);
+          }
+        }
+      }
+    }
+  }
 }
 
 

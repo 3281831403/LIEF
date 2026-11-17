@@ -57,6 +57,14 @@
   * Fix the ``sh_info`` value of ``.symtab`` after the binary is written: it was
     set to the index of the first exported symbol instead of the first non-local
     symbol.
+  * Shrink ``.dynsym``, ``.gnu.version`` and ``.gnu.version_d`` in place when
+    dynamic symbols are removed (e.g. with ``Binary::remove_dynamic_symbol``).
+    The sections keep their original
+    offsets and virtual addresses, and the version definitions that are no
+    longer referenced by any dynamic symbol are dropped from ``.gnu.version_d``
+    along with ``DT_VERDEFNUM``. Previously, the default (non-relocating)
+    write kept the original table sizes which made ghost symbols with garbage
+    names appear when the output was parsed again.
 
 :COFF:
 

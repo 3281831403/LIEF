@@ -136,6 +136,24 @@ ok_error_t Builder::build_exe_lib() {
   uint32_t new_symndx = sort_dynamic_symbols();
   layout->set_dyn_sym_idx(new_symndx);
 
+  // Shrink a section in place when its content gets smaller (e.g. after
+  // removing dynamic symbols). The section keeps its original file offset
+  // and virtual address while its size is reduced to `new_size`. The
+  // released bytes are zeroed so that no stale content is left behind.
+  const auto shrink_section = [this](Section::TYPE type, uint64_t new_size) {
+    Section* section = binary_->get(type);
+    if (section == nullptr || section->size() <= new_size) {
+      return;
+    }
+    LIEF_DEBUG("Shrink section '{}' in place: {:#x} -> {:#x} bytes",
+               section->name(), section->size(), new_size);
+    span<uint8_t> content = section->writable_content();
+    if (new_size < content.size()) {
+      std::fill(content.begin() + new_size, content.end(), 0);
+    }
+    section->size(new_size);
+  };
+
   Segment* pt_interp = binary_->get(Segment::TYPE::INTERP);
   if (config_.interpreter) {
     if (pt_interp != nullptr) {
@@ -320,6 +338,7 @@ ok_error_t Builder::build_exe_lib() {
       layout->relocate_dynsym(dynsym_needed_size);
     } else {
       LIEF_DEBUG("DT_SYMTAB: -{:#x} bytes", osize - dynsym_needed_size);
+      shrink_section(Section::TYPE::DYNSYM, dynsym_needed_size);
     }
   }
 
@@ -390,6 +409,7 @@ ok_error_t Builder::build_exe_lib() {
       layout->relocate_symver(symver_needed_size);
     } else {
       LIEF_DEBUG("DT_VERSYM: -{:#x} bytes", osize - symver_needed_size);
+      shrink_section(Section::TYPE::GNU_VERSYM, symver_needed_size);
     }
   }
 
@@ -404,6 +424,12 @@ ok_error_t Builder::build_exe_lib() {
       layout->relocate_symverd(symvdef_needed_size);
     } else {
       LIEF_DEBUG("DT_VERDEF: -{:#x} bytes", osize - symvdef_needed_size);
+      shrink_section(Section::TYPE::GNU_VERDEF, symvdef_needed_size);
+    }
+    // sh_info holds the number of version definitions
+    if (Section* sec = binary_->get(Section::TYPE::GNU_VERDEF)) {
+      sec->information(
+          static_cast<uint32_t>(binary_->symbol_version_definition_.size()));
     }
   }
 
@@ -1259,6 +1285,12 @@ ok_error_t Builder::build_symbol_hash() {
     return make_error_code(lief_errors::build_error);
   }
 
+  // Keep the in-memory hash table consistent with the one being written
+  // (e.g. after removing dynamic symbols)
+  if (binary_->sysv_hash_ != nullptr) {
+    binary_->sysv_hash_->nchain(nchain);
+  }
+
   const size_t buckets_limits = nbucket + nchain + 2;
   std::vector<uint8_t> new_hash_table(buckets_limits * sizeof(uint32_t), 0);
   auto* new_hash_table_ptr = reinterpret_cast<uint32_t*>(new_hash_table.data());
@@ -1923,6 +1955,9 @@ ok_error_t Builder::build_symbol_definition() {
   if (svd_nb != binary_->symbol_version_definition_.size()) {
     LIEF_WARN("The number of symbol version definition entries "
               "in the binary differ from the value in DT_VERDEFNUM");
+    // Keep DT_VERDEFNUM consistent with the definitions being written
+    // so that parsers don't read past the end of the table.
+    dt_verdefnum->value(binary_->symbol_version_definition_.size());
   }
 
   auto sym_verdef = binary_->symbols_version_definition();
